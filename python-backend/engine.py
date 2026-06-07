@@ -11,10 +11,19 @@ import praw
 from fredapi import Fred
 import google.generativeai as genai
 import matplotlib.pyplot as plt
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 from reportlab.pdfgen import canvas
+from flask import Flask, jsonify
+import threading
+
+app = Flask(__name__)
+
+@app.route("/")
+def health_check():
+    return jsonify({"status": "healthy", "message": "Market Engine is running."})
+
 
 # ==========================================
 # STEP 1: Multi-Source Data Pipeline
@@ -201,10 +210,15 @@ def generate_weekly_report(prediction_direction, confidence, top_features):
 
 # Scheduler
 def scheduled_job():
-    print("Running weekly prediction pipeline...")
+    print("Running prediction pipeline...")
+
+# Initialize and start scheduler
+scheduler = BackgroundScheduler()
+# Run every 30 minutes
+scheduler.add_job(scheduled_job, 'interval', minutes=30)
+scheduler.start()
 
 if __name__ == "__main__":
     print("Market Engine Initiated.")
-    # scheduler = BlockingScheduler()
-    # scheduler.add_job(scheduled_job, 'cron', day_of_week='mon', hour=8)
-    # scheduler.start()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
