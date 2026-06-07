@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: market-intelligence-api
+    env: python
+    buildCommand: "pip install -r python-backend/requirements.txt"
+    startCommand: "cd python-backend && gunicorn engine:app --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
