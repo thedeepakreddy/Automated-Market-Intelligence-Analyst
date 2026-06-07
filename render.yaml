@@ -1,6 +1,7 @@
 services:
   - type: web
     name: market-intelligence-api
+    plan: free
     env: python
     buildCommand: "pip install -r python-backend/requirements.txt"
     startCommand: "cd python-backend && gunicorn engine:app --bind 0.0.0.0:$PORT"
