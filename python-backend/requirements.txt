@@ -16,3 +16,5 @@ sqlalchemy
 psycopg2-binary
 reportlab
 matplotlib
+Flask
+gunicorn
