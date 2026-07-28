@@ -5,8 +5,7 @@ An end-to-end quantitative research system that forecasts the 7-day directional 
 Repository: https://github.com/thedeepakreddy/Automated-Market-Intelligence-Analyst
 
 ---
-[dashboard](Automated-Market-Intelligence-Analyst
-/dashboard.png)
+[dashboard](Automated-Market-Intelligence-Analyst/dashboard.png)
 
 ## Overview
 
