@@ -1,7 +1,7 @@
 # Automated Market Intelligence Analyst
 
 An end-to-end quantitative research system that forecasts the 7-day directional move of the S&P 500 by fusing price action, macroeconomic releases, and social sentiment into an explainable ensemble model, then publishes the output through a production-deployed research dashboard.
-
+website: https://market-intelligence-frontend.onrender.com
 Repository: https://github.com/thedeepakreddy/Automated-Market-Intelligence-Analyst
 
 ---
