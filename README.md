@@ -1,19 +1,20 @@
 # Automated Market Intelligence Analyst
 
-An end-to-end quantitative research system that forecasts the 7-day directional move of the S&P 500 by fusing price action, macroeconomic releases, and social sentiment into an explainable ensemble model, then publishes the output through a production-deployed research dashboard.
+An end-to-end quantitative research system that forecasts the 7-day directional move of the S&P 500 by fusing price action, macroeconomic releases, and social sentiment into an explainable ensemble[...]
 
 App Website: https://market-intelligence-frontend.onrender.com
 
 Repository: https://github.com/thedeepakreddy/Automated-Market-Intelligence-Analyst
 
 ---
-[dashboard](Automated-Market-Intelligence-Analyst/dashboard.png)
+
+![dashboard](./dashboard.png)
 
 ## Overview
 
-Most retail-facing market models stop at a prediction. A research desk needs three things a prediction alone cannot provide: a defensible data lineage, a validation scheme that respects time, and an explanation of *why* the model is positioned the way it is.
+Most retail-facing market models stop at a prediction. A research desk needs three things a prediction alone cannot provide: a defensible data lineage, a validation scheme that respects time, and an e[...]
 
-This project is built around those three requirements. It ingests four asset series and five macro indicators, engineers a momentum and volatility feature set, trains a gradient-boosted tree and a recurrent neural network on a strictly chronological split, blends their probabilities into a single directional call with an explicit uncertainty band, and attributes that call back to individual features using SHAP. A scheduler re-runs the pipeline autonomously, and a language model drafts the weekly outlook note in the format of a desk research memo.
+This project is built around those three requirements. It ingests four asset series and five macro indicators, engineers a momentum and volatility feature set, trains a gradient-boosted tree and a[...]
 
 The result is a working analogue of the workflow an analyst runs manually every week, compressed into a repeatable, auditable pipeline.
 
@@ -48,7 +49,7 @@ The result is a working analogue of the workflow an analyst runs manually every 
 | FRED (`fredapi`) | CPIAUCSL, UNRATE, FEDFUNDS, A191RL1Q225SBEA, UMCSENT | Inflation, labour, policy rate, growth, and consumer confidence regime context |
 | Reddit (`praw`) | Retail finance discussion | Crowd positioning and sentiment momentum |
 
-Macro series publish at monthly or quarterly frequency, so they are resampled to a daily index and forward-filled. This deliberately avoids look-ahead: a value is only carried forward from its release date, never interpolated backward from a future print.
+Macro series publish at monthly or quarterly frequency, so they are resampled to a daily index and forward-filled. This deliberately avoids look-ahead: a value is only carried forward from its rel[...]
 
 ---
 
@@ -65,7 +66,7 @@ For each macro series:
 
 - Level plus 30-day month-over-month percentage change, so the model reads the *direction of the surprise* rather than only the absolute level
 
-**Target definition**: a binary label, one if the S&P 500 close seven sessions forward exceeds today's close, zero otherwise. Framing the problem as directional classification rather than point-estimate regression matches how a positioning decision is actually made, and avoids optimising a loss function nobody trades on.
+**Target definition**: a binary label, one if the S&P 500 close seven sessions forward exceeds today's close, zero otherwise. Framing the problem as directional classification rather than point-es[...]
 
 ---
 
@@ -84,7 +85,7 @@ The two probabilities are averaged, and the blend is mapped to a three-state sig
 | 0.45 to 0.55 | UNCERTAIN |
 | Below 0.45 | DOWN |
 
-The neutral band is the point of the design. A model forced to be long or short every week generates turnover with no edge; declining to take a view when the signal sits inside the noise band is a risk-management decision, not a modelling failure.
+The neutral band is the point of the design. A model forced to be long or short every week generates turnover with no edge; declining to take a view when the signal sits inside the noise band is a[...]
 
 ---
 
@@ -104,7 +105,7 @@ These constraints lower headline accuracy relative to a randomly shuffled split.
 
 SHAP `TreeExplainer` runs against the gradient-boosted model to produce per-prediction feature attribution, surfaced in the dashboard as a ranked contribution chart.
 
-This is the component that turns a score into research. It answers the question a portfolio manager asks first: is this call being driven by price momentum, by a shift in the rates and inflation complex, or by retail sentiment? A model that cannot answer that will not survive an investment committee.
+This is the component that turns a score into research. It answers the question a portfolio manager asks first: is this call being driven by price momentum, by a shift in the rates and inflation [...]
 
 ---
 
@@ -235,13 +236,13 @@ Connect the repository under Blueprints in Render and both services provision fr
 
 ## Project Status
 
-The data pipeline, feature engineering, ensemble architecture, SHAP explainability, API, scheduler, and full dashboard are implemented. The following are scoped and in progress, and the interface currently renders representative values for them:
+The data pipeline, feature engineering, ensemble architecture, SHAP explainability, API, scheduler, and full dashboard are implemented. The following are scoped and in progress, and the interface[...]
 
 - **Backtest engine** — `run_backtest` is stubbed; the equity curve and strategy metrics panel are placeholders pending live wiring
 - **Sentiment ingestion** — the Reddit and VADER path is scaffolded; the pipeline currently synthesises the sentiment series while ingestion is completed
 - **Persistence** — SQLAlchemy and Postgres are in the dependency set for prediction history; the history table does not yet read from a live store
 
-These are called out deliberately. The metrics shown in the dashboard are interface placeholders, not validated performance claims, and should be read as such until the backtest engine is connected.
+These are called out deliberately. The metrics shown in the dashboard are interface placeholders, not validated performance claims, and should be read as such until the backtest engine is connect[...]
 
 ### Roadmap
 
@@ -266,7 +267,7 @@ These are called out deliberately. The metrics shown in the dashboard are interf
 
 ## Disclaimer
 
-This project is for educational and research purposes only. It is not investment advice, and nothing here is a recommendation to buy or sell any security. Model outputs are experimental and have not been validated for live trading.
+This project is for educational and research purposes only. It is not investment advice, and nothing here is a recommendation to buy or sell any security. Model outputs are experimental and have not b[...]
 
 ---
 
