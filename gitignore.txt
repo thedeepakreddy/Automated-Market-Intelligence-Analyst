@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Engine output (generated at runtime)
+*.db
+weekly_report.pdf
+
+# Node
+node_modules/
+dist/
+
+# Local environment
+.env
+.env.local
