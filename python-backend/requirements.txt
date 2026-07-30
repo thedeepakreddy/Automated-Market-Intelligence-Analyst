@@ -8,6 +8,7 @@ tensorflow
 keras
 scikit-learn
 praw
+nltk
 fredapi
 google-generativeai
 plotly
