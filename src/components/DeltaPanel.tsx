@@ -1,4 +1,3 @@
-import React from 'react';
 import type { Delta } from '../lib/api';
 import { featureLabel, pp, shortDate, signed } from '../lib/format';
 import { Empty, Panel } from './Panel';

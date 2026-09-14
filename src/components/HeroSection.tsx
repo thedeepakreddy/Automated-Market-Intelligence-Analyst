@@ -1,4 +1,3 @@
-import React from 'react';
 import type { Delta, EventWindow, Signal } from '../lib/api';
 import { pct, pp, fullDate } from '../lib/format';
 import { SIGNAL_COLOR, SIGNAL_GLYPH } from './Panel';

@@ -1,4 +1,3 @@
-import React from 'react';
 import type { Signal } from '../lib/api';
 
 /** The glass panel every section sits in. */
@@ -20,8 +19,8 @@ export function Panel({
   return (
     <section className={`glass p-5 sm:p-6 ${className}`}>
       {(title || aside) && (
-        <header className="flex items-start justify-between gap-4 mb-5">
-          <div className="min-w-0">
+        <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 mb-5">
+          <div className="min-w-0 flex-1 basis-40">
             {eyebrow && <p className="label-eyebrow mb-1.5">{eyebrow}</p>}
             {title && (
               <h3 className="text-sm font-medium text-zinc-100 leading-tight">{title}</h3>

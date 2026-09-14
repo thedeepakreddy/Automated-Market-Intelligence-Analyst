@@ -1,5 +1,3 @@
-import React from 'react';
-
 /**
  * Shared chart chrome, so every chart reads as one system.
  *

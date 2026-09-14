@@ -1,4 +1,3 @@
-import React from 'react';
 import type { Disagreement, Divergence, SurpriseIndex } from '../lib/api';
 import { num, pct } from '../lib/format';
 import { Panel } from './Panel';
