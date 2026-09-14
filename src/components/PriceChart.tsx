@@ -1,53 +1,114 @@
-import React from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { num, shortDate } from '../lib/format';
+import { AXIS_TICK, ChartTooltip, GRID_STROKE } from './ChartBits';
+import { Empty, Panel, Skeleton } from './Panel';
 
-const mockPriceData = Array.from({ length: 60 }).map((_, i) => {
-  const base = 5000 + (Math.sin(i / 5) * 200) + (i * 10);
-  const noise = (Math.random() - 0.5) * 50;
-  return {
-    date: `D${i + 1}`,
-    Price: base + noise,
-    SMA_7: base + noise - 20,
-    SMA_30: base - 50
-  };
-});
+interface Point {
+  date: string;
+  close: number;
+}
 
-const CustomTooltip = ({ active, payload }: any) => {
-  if (active && payload && payload.length) {
-    return (
-      <div className="bg-zinc-950 border border-zinc-800 p-3 rounded-lg text-xs font-mono">
-        <p className="text-zinc-400 mb-2">{payload[0].payload.date}</p>
-        {payload.map((entry: any, index: number) => (
-          <div key={index} className="flex gap-4 justify-between" style={{ color: entry.stroke }}>
-            <span>{entry.name}</span>
-            <span className="font-medium">{(entry.value).toFixed(1)}</span>
-          </div>
-        ))}
-      </div>
-    );
-  }
-  return null;
-};
+/** One series, so the title names it and no legend is needed. */
+export function PriceChart({
+  points,
+  loading,
+  error,
+}: {
+  points: Point[] | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  const last = points?.[points.length - 1];
+  const first = points?.[0];
+  const change = first && last && first.close ? last.close / first.close - 1 : null;
 
-export function PriceChart() {
   return (
-    <div className="bg-black border border-zinc-900 rounded-2xl p-6">
-      <div className="flex justify-between items-baseline mb-6">
-        <h3 className="text-sm font-medium text-zinc-100">Price vs Trends (6M)</h3>
-        <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">S&P500</span>
-      </div>      
-      <div className="h-64 sm:h-80 -ml-5">
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={mockPriceData}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#18181b" vertical={false} />
-            <XAxis dataKey="date" stroke="#52525b" tick={{fill: '#52525b', fontSize: 10, fontFamily: 'monospace'}} axisLine={false} tickLine={false} dy={10} />
-            <YAxis domain={['auto', 'auto']} stroke="#52525b" tick={{fill: '#52525b', fontSize: 10, fontFamily: 'monospace'}} axisLine={false} tickLine={false} dx={-10} />
-            <Tooltip content={<CustomTooltip />} />
-            <Line type="monotone" dataKey="Price" stroke="#f4f4f5" strokeWidth={1.5} dot={false} activeDot={{ r: 4, fill: '#f4f4f5' }} />
-            <Line type="monotone" dataKey="SMA_30" stroke="#52525b" strokeWidth={1.5} dot={false} strokeDasharray="4 4" />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-    </div>
+    <Panel
+      title="S&P 500 close"
+      eyebrow={points?.length ? `${points.length} sessions` : 'Price history'}
+      aside={
+        last ? (
+          <>
+            <p className="font-mono text-lg text-zinc-100 tabular-nums">
+              {last.close.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+            </p>
+            <p
+              className="font-mono text-[11px]"
+              style={{
+                color: (change ?? 0) >= 0 ? 'var(--status-good)' : 'var(--status-critical)',
+              }}
+            >
+              {change === null ? '' : `${change >= 0 ? '+' : ''}${(change * 100).toFixed(2)}%`}
+            </p>
+          </>
+        ) : null
+      }
+    >
+      {loading ? (
+        <Skeleton lines={6} />
+      ) : !points?.length ? (
+        <Empty
+          message={error ?? 'No price history yet.'}
+          hint="Populated once the pipeline completes its first run."
+        />
+      ) : (
+        <div className="h-60 sm:h-72 -ml-2">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+              <defs>
+                <linearGradient id="priceFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="var(--series-1)" stopOpacity={0.28} />
+                  <stop offset="100%" stopColor="var(--series-1)" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke={GRID_STROKE} vertical={false} />
+              <XAxis
+                dataKey="date"
+                tick={AXIS_TICK}
+                tickFormatter={shortDate}
+                axisLine={false}
+                tickLine={false}
+                minTickGap={48}
+              />
+              <YAxis
+                tick={AXIS_TICK}
+                axisLine={false}
+                tickLine={false}
+                width={52}
+                domain={['auto', 'auto']}
+                tickFormatter={(value: number) => value.toFixed(0)}
+              />
+              <Tooltip
+                cursor={{ stroke: 'var(--axis)', strokeWidth: 1 }}
+                content={({ active, payload }: any) =>
+                  active && payload?.length ? (
+                    <ChartTooltip
+                      title={shortDate(payload[0].payload.date)}
+                      rows={[
+                        {
+                          label: 'Close',
+                          value: num(payload[0].payload.close, 2),
+                          color: 'var(--series-1)',
+                        },
+                      ]}
+                    />
+                  ) : null
+                }
+              />
+              <Area
+                type="monotone"
+                dataKey="close"
+                stroke="var(--series-1)"
+                strokeWidth={2}
+                fill="url(#priceFill)"
+                dot={false}
+                activeDot={{ r: 4, strokeWidth: 2, stroke: 'var(--surface-1)' }}
+                isAnimationActive={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </Panel>
   );
 }

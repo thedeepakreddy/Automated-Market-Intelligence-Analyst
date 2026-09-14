@@ -5,3 +5,106 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
+
+/*
+  Glassmorphism, minimal. One dark plane, translucent panels floating on it,
+  and colour reserved for things that carry meaning: the signal, the series in
+  a chart, the direction of a change. Everything else is ink on glass.
+
+  Series colours are the validated dark-mode categorical steps (blue, orange,
+  aqua) and the fixed status palette. They are declared once here as roles so
+  the charts are written against roles, never raw hex.
+*/
+:root {
+  color-scheme: dark;
+
+  --surface-page: #08080a;
+  --surface-1: #0e0e12;
+
+  --text-primary: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+
+  --gridline: #23232a;
+  --axis: #3f3f46;
+
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+
+  --glass-border: rgba(255, 255, 255, 0.09);
+  --glass-border-strong: rgba(255, 255, 255, 0.14);
+}
+
+body {
+  background-color: var(--surface-page);
+  color: var(--text-primary);
+  min-height: 100vh;
+}
+
+/* Two very soft light sources so the glass has something to refract. Fixed and
+   non-interactive: it is atmosphere, not content. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(60rem 60rem at 15% -10%, rgba(57, 135, 229, 0.13), transparent 60%),
+    radial-gradient(50rem 50rem at 95% 5%, rgba(25, 158, 112, 0.09), transparent 55%),
+    radial-gradient(40rem 40rem at 60% 110%, rgba(217, 89, 38, 0.06), transparent 60%);
+}
+
+@layer components {
+  .glass {
+    background-image: linear-gradient(
+      160deg,
+      rgba(255, 255, 255, 0.055),
+      rgba(255, 255, 255, 0.018)
+    );
+    backdrop-filter: blur(22px) saturate(140%);
+    -webkit-backdrop-filter: blur(22px) saturate(140%);
+    border: 1px solid var(--glass-border);
+    border-radius: 1.25rem;
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.06),
+      0 20px 40px -24px rgba(0, 0, 0, 0.9);
+  }
+
+  /* Inset wells for nested content - the inverse of a raised panel. */
+  .glass-well {
+    background-color: rgba(0, 0, 0, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 0.875rem;
+  }
+
+  .label-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+}
+
+/* Recharts paints its own focus ring on every hover; suppress it so the
+   crosshair reads cleanly. */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -542,12 +542,18 @@ def test_latest_serves_the_most_recent_run(api_client):
 # ------------------------------------------------------------------
 # Social sentiment
 # ------------------------------------------------------------------
-def _ago(days, hours=12):
-    """A UTC timestamp `days` ago, as praw reports created_utc."""
-    moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        days=days, hours=hours
-    )
-    return moment.timestamp()
+def _ago(days):
+    """A UTC timestamp `days` calendar days ago, as praw reports created_utc.
+
+    Anchored to midnight of the target date rather than "now minus N hours":
+    an hour offset silently moves a post into the previous day's bucket
+    whenever the suite runs early in the UTC day, which made these tests pass
+    or fail depending on the clock.
+    """
+    target = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=days)
+    return datetime.datetime.combine(
+        target, datetime.time.min, tzinfo=datetime.timezone.utc
+    ).timestamp()
 
 
 class StubComment:
@@ -604,6 +610,13 @@ class StubReddit:
 def reddit_pipeline():
     """A pipeline whose Reddit client is a stub, with VADER scoring for real."""
     pytest.importorskip("nltk")
+    # Real VADER scoring needs the lexicon on disk. Skip rather than fail where
+    # it is absent and cannot be fetched (offline or proxy-restricted hosts):
+    # `python -m nltk.downloader vader_lexicon` installs it.
+    try:
+        engine._vader_analyzer()
+    except Exception as exc:  # noqa: BLE001 - any failure here means "no lexicon"
+        pytest.skip(f"VADER lexicon unavailable: {exc}")
     posts = {
         "investing": [
             StubPost(

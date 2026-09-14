@@ -33,7 +33,7 @@ import xgboost as xgb
 import yfinance as yf
 import google.generativeai as genai
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from fredapi import Fred
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import LETTER
@@ -50,6 +50,10 @@ from reportlab.platypus import (
 )
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
+
+import analytics
+import events
+import narratives
 
 # tensorflow, shap and nltk are imported inside the functions that need them.
 # They are heavy (or need a corpus download), and the rest of the module -
@@ -136,7 +140,28 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_predictions_generated_at
     ON predictions (generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    from_signal TEXT,
+    to_signal   TEXT,
+    as_of_date  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts (created_at DESC);
 """
+
+# Columns added after the first release. Existing databases are migrated in
+# place rather than rebuilt, so a deployment upgrade keeps its history.
+_ADDED_COLUMNS = {
+    "analytics": "TEXT",        # delta, analogues, regime, flip points, themes...
+    "resolved_at": "TEXT",      # when the outcome was scored
+    "actual_direction": "TEXT",  # what the market actually did
+    "correct": "INTEGER",       # 1/0, NULL while unresolved or UNCERTAIN
+    "realized_return": "REAL",  # forward return actually realised
+}
 
 
 def _connect():
@@ -148,6 +173,16 @@ def _connect():
 def init_db():
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn):
+    """Add any columns this version needs that an older database lacks."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(predictions)")}
+    for column, column_type in _ADDED_COLUMNS.items():
+        if column not in existing:
+            LOG.info("Migrating predictions: adding column %s", column)
+            conn.execute(f"ALTER TABLE predictions ADD COLUMN {column} {column_type}")
 
 
 def save_prediction(record):
@@ -168,6 +203,7 @@ def save_prediction(record):
         "report_text": record.get("report", {}).get("text"),
         "report_source": record.get("report", {}).get("source"),
         "report_path": record.get("report", {}).get("pdf_path"),
+        "analytics": json.dumps(record.get("analytics", {})),
     }
     columns = ", ".join(row)
     placeholders = ", ".join(f":{name}" for name in row)
@@ -178,16 +214,12 @@ def save_prediction(record):
         return cursor.lastrowid
 
 
-def load_latest_prediction():
-    """Most recent run as the dict shape the API serves, or None if empty."""
-    with _connect() as conn:
-        conn.executescript(SCHEMA)  # first request can precede the first write
-        row = conn.execute(
-            "SELECT * FROM predictions ORDER BY generated_at DESC, id DESC LIMIT 1"
-        ).fetchone()
+def _row_to_record(row):
+    """One predictions row in the shape the API serves."""
     if row is None:
         return None
-    return {
+    keys = row.keys()
+    record = {
         "id": row["id"],
         "generated_at": row["generated_at"],
         "as_of_date": row["as_of_date"],
@@ -204,7 +236,137 @@ def load_latest_prediction():
             "source": row["report_source"],
             "pdf_path": row["report_path"],
         },
+        "analytics": json.loads(row["analytics"] or "{}") if "analytics" in keys else {},
     }
+    if "correct" in keys:
+        record["outcome"] = {
+            "resolved_at": row["resolved_at"],
+            "actual_direction": row["actual_direction"],
+            "correct": None if row["correct"] is None else bool(row["correct"]),
+            "realized_return": row["realized_return"],
+        }
+    return record
+
+
+def _ensure_schema(conn):
+    conn.executescript(SCHEMA)  # a request can precede the first write
+    _migrate(conn)
+
+
+def load_latest_prediction():
+    """Most recent run as the dict shape the API serves, or None if empty."""
+    with _connect() as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM predictions ORDER BY generated_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    return _row_to_record(row)
+
+
+def load_prediction_history(limit=200, resolved_only=False):
+    """Runs oldest-first, so callers can diff or chart them in time order."""
+    clause = "WHERE correct IS NOT NULL" if resolved_only else ""
+    with _connect() as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            f"SELECT * FROM predictions {clause} ORDER BY generated_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_row_to_record(row) for row in reversed(rows)]
+
+
+def load_previous_prediction(before_generated_at):
+    """The run immediately preceding a timestamp - the delta's comparison point."""
+    with _connect() as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM predictions WHERE generated_at < ? "
+            "ORDER BY generated_at DESC, id DESC LIMIT 1",
+            (before_generated_at,),
+        ).fetchone()
+    return _row_to_record(row)
+
+
+def resolve_predictions(price_series, horizon=HORIZON):
+    """Score past calls against what the market actually did.
+
+    A call made on session *t* is resolved once `horizon` further sessions have
+    printed. UNCERTAIN calls are resolved for their realised return but left
+    with ``correct = NULL``: declining to take a view is neither right nor
+    wrong, and scoring it either way would flatter or punish the model unfairly.
+
+    Returns the number of predictions newly resolved.
+    """
+    if price_series is None or len(price_series) == 0:
+        return 0
+
+    prices = price_series.dropna()
+    index = pd.DatetimeIndex(prices.index).normalize()
+    resolved_count = 0
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+    with _connect() as conn:
+        _ensure_schema(conn)
+        pending = conn.execute(
+            "SELECT id, as_of_date, direction FROM predictions WHERE resolved_at IS NULL"
+        ).fetchall()
+
+        for row in pending:
+            try:
+                as_of = pd.Timestamp(row["as_of_date"]).normalize()
+            except (ValueError, TypeError):
+                continue
+
+            positions = index.get_indexer([as_of], method="nearest")
+            start = int(positions[0])
+            if start < 0 or start + horizon >= len(prices):
+                continue  # the forward window has not printed yet
+
+            start_price = float(prices.iloc[start])
+            end_price = float(prices.iloc[start + horizon])
+            if not start_price:
+                continue
+
+            realized = end_price / start_price - 1
+            actual = "UP" if realized > 0 else "DOWN"
+            correct = None if row["direction"] == "UNCERTAIN" else int(row["direction"] == actual)
+
+            conn.execute(
+                "UPDATE predictions SET resolved_at = ?, actual_direction = ?, "
+                "correct = ?, realized_return = ? WHERE id = ?",
+                (now, actual, correct, realized, row["id"]),
+            )
+            resolved_count += 1
+
+    if resolved_count:
+        LOG.info("Resolved %d past prediction(s) against realised prices", resolved_count)
+    return resolved_count
+
+
+def save_alert(kind, message, from_signal=None, to_signal=None, as_of_date=None):
+    with _connect() as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            "INSERT INTO alerts (created_at, kind, message, from_signal, to_signal, as_of_date) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                kind,
+                message,
+                from_signal,
+                to_signal,
+                as_of_date,
+            ),
+        )
+
+
+def load_alerts(limit=25):
+    with _connect() as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 # ==========================================
@@ -284,6 +446,8 @@ class DataPipeline:
                 check_for_async=False,
             )
         self.subreddits = tuple(subreddits) if subreddits else sentiment_subreddits()
+        # Populated by fetch_social_sentiment; the narrative layer reads it.
+        self.last_documents = []
 
     def fetch_market_data(self, lookback_days=LOOKBACK_DAYS):
         end_date = datetime.date.today() + datetime.timedelta(days=1)  # end is exclusive
@@ -379,6 +543,9 @@ class DataPipeline:
                     {
                         "date": created.date(),
                         "score": analyzer.polarity_scores(text)["compound"],
+                        "text": (post.title or "").strip(),
+                        "kind": "post",
+                        "subreddit": name,
                     }
                 )
 
@@ -394,11 +561,20 @@ class DataPipeline:
                             {
                                 "date": comment_date,
                                 "score": analyzer.polarity_scores(body)["compound"],
+                                "text": body.strip()[:400],
+                                "kind": "comment",
+                                "subreddit": name,
                             }
                         )
 
         if not scored:
             raise RuntimeError("Reddit returned no scoreable posts or comments")
+
+        # Kept for the narrative layer, which needs the words and not just the
+        # polarity. Newest first, and capped so the object stays small.
+        self.last_documents = sorted(
+            scored, key=lambda item: item["date"], reverse=True
+        )[:400]
 
         raw = pd.DataFrame(scored)
         daily = raw.groupby("date")["score"].agg(["mean", "count"])
@@ -436,8 +612,20 @@ def _vader_analyzer():
         try:
             _VADER = SentimentIntensityAnalyzer()
         except LookupError:
-            nltk.download("vader_lexicon", quiet=True)
-            _VADER = SentimentIntensityAnalyzer()
+            LOG.info("VADER lexicon missing; downloading it once")
+            downloaded = nltk.download("vader_lexicon", quiet=True)
+            try:
+                _VADER = SentimentIntensityAnalyzer()
+            except LookupError as exc:
+                # A bare LookupError here is unhelpful to an operator. Say what
+                # is missing and how to install it, since some environments
+                # (notably proxied ones) refuse NLTK's downloader outright.
+                raise RuntimeError(
+                    "The VADER lexicon is unavailable and could not be downloaded "
+                    f"(nltk.download returned {downloaded}). Install it once with "
+                    "`python -m nltk.downloader vader_lexicon`, or set "
+                    "NLTK_ALLOW_PROXIED_URLOPEN=1 if this host fetches through a proxy."
+                ) from exc
     return _VADER
 
 
@@ -507,7 +695,16 @@ def feature_engineering(
     the current-week prediction is made from.
     """
     panel = build_feature_panel(market_df, macro_df, sentiment_df, horizon=horizon)
+    return split_panel(panel, train_fraction=train_fraction)
 
+
+def split_panel(panel, train_fraction=0.8):
+    """Split an already-built panel into ``(train_df, test_df, live_df)``.
+
+    Separate from ``feature_engineering`` so the pipeline can build the panel
+    once and use it for both modelling and the analytics that need full
+    history (analogues, regimes, divergence) without paying for it twice.
+    """
     labelled = panel[panel[TARGET_COL].notna()].copy()
     labelled[TARGET_COL] = labelled[TARGET_COL].astype(int)
     live_df = panel[panel[TARGET_COL].isna()].drop(columns=[TARGET_COL])
@@ -623,17 +820,31 @@ class EnsembleModel:
         values = np.asarray(X, dtype="float32")
         return values.reshape((values.shape[0], 1, values.shape[1]))
 
-    def predict_proba(self, X):
-        """Averaged P(up) for each row of X."""
+    def predict_components(self, X):
+        """Each member's P(up) alongside the blend.
+
+        The average is what gets traded, but the *spread* between the two is
+        information in its own right: when a tree ensemble and a sequence model
+        disagree about the same week, that is a live uncertainty signal, and
+        averaging it away hides it.
+        """
         xgb_probs = np.asarray(self.xgb_model.predict_proba(X))[:, 1]
         if self.lstm_model is None:
             LOG.warning("LSTM unavailable; probabilities are XGBoost-only")
-            return xgb_probs
+            return {"xgboost": xgb_probs, "lstm": None, "ensemble": xgb_probs}
 
         lstm_probs = np.asarray(
             self.lstm_model.predict(self._reshape(X), verbose=0)
         ).flatten()
-        return (xgb_probs + lstm_probs) / 2
+        return {
+            "xgboost": xgb_probs,
+            "lstm": lstm_probs,
+            "ensemble": (xgb_probs + lstm_probs) / 2,
+        }
+
+    def predict_proba(self, X):
+        """Averaged P(up) for each row of X."""
+        return self.predict_components(X)["ensemble"]
 
     def predict(self, X):
         """``[(direction, probability), ...]``, one tuple per row of X."""
@@ -1148,6 +1359,12 @@ def _text_to_paragraphs(text):
 # ==========================================
 # STEP 7: Pipeline orchestration
 # ==========================================
+# The most recent fitted model and its live feature row. /api/whatif re-scores
+# perturbed inputs against this instead of retraining per request. Empty until
+# the first run completes, and replaced wholesale by each run.
+_LIVE = {"model": None, "row": None, "history": None, "as_of": None, "generated_at": None}
+
+
 def run_pipeline(persist=True):
     """Ingest, train, predict, backtest, report and persist one full run."""
     started = datetime.datetime.now(datetime.timezone.utc)
@@ -1174,7 +1391,10 @@ def run_pipeline(persist=True):
         sentiment_df = neutral_sentiment_frame()
         sources["sentiment"] = f"neutral_fallback ({exc})"
 
-    train_df, test_df, live_df = feature_engineering(market_df, macro_df, sentiment_df)
+    # Built once: modelling splits come off it, and so do the analytics that
+    # need full history (analogues, regimes, divergence).
+    panel = build_feature_panel(market_df, macro_df, sentiment_df)
+    train_df, test_df, live_df = split_panel(panel)
     X_train, y_train = split_features_target(train_df)
     X_test, y_test = split_features_target(test_df)
     LOG.info(
@@ -1202,8 +1422,12 @@ def run_pipeline(persist=True):
     # labelled row so a run always produces a signal.
     latest_X = (live_df if not live_df.empty else X_test).iloc[[-1]]
     latest_X = latest_X[model.feature_names]
-    direction, probability = model.predict(latest_X)[0]
-    features, attribution_source = top_features(model.xgb_model, latest_X)
+    components = model.predict_components(latest_X)
+    probability = float(components["ensemble"][-1])
+    direction = classify_probability(probability, model.up_threshold, model.down_threshold)
+    # Keep more drivers than the dashboard shows: the delta engine diffs this
+    # list run over run, and a 5-item list produces mostly "entered"/"exited".
+    features, attribution_source = top_features(model.xgb_model, latest_X, top_n=15)
     as_of = _index_label(latest_X.index[-1])
 
     LOG.info(
@@ -1216,13 +1440,44 @@ def run_pipeline(persist=True):
     )
 
     confidence = confidence_from_probability(probability)
+
+    # Read the previous run before writing this one: it is the comparison point
+    # for the delta engine, the theme shift, and the signal-change alert.
+    previous = load_latest_prediction() if persist else None
+
+    # Score any past calls whose forward window has now printed. Doing this
+    # before the scorecard is read means the record is always current.
+    if persist:
+        try:
+            resolve_predictions(panel[PRICE_COL])
+        except Exception:
+            LOG.exception("Resolving past predictions failed; continuing")
+
     try:
         report = generate_weekly_report(
-            direction, confidence, features, backtest=backtest, as_of=as_of
+            direction, confidence, features[:5], backtest=backtest, as_of=as_of
         )
     except Exception as exc:
         LOG.exception("Weekly report generation failed")
         report = {"text": None, "source": f"failed ({exc})", "pdf_path": None}
+
+    analytics_payload = _build_analytics(
+        panel=panel,
+        macro_df=macro_df,
+        model=model,
+        latest_X=latest_X,
+        features=features,
+        components=components,
+        as_of=as_of,
+        previous=previous,
+        current={
+            "prediction": direction,
+            "probability": probability,
+            "confidence": confidence,
+            "top_features": features,
+        },
+        documents=getattr(pipeline, "last_documents", []),
+    )
 
     record = {
         "generated_at": started.isoformat(timespec="seconds"),
@@ -1247,6 +1502,7 @@ def run_pipeline(persist=True):
         "backtest": backtest,
         "data_sources": sources,
         "report": report,
+        "analytics": analytics_payload,
         "runtime_seconds": round(
             (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds(), 1
         ),
@@ -1254,7 +1510,169 @@ def run_pipeline(persist=True):
 
     if persist:
         record["id"] = save_prediction(record)
+        _raise_alerts(record, previous)
+
+    # Cache the fitted model so /api/whatif can re-score perturbed inputs
+    # without retraining. Replaced wholesale on each run.
+    _LIVE.update(
+        {
+            "model": model,
+            "row": latest_X,
+            "history": panel[model.feature_names] if set(model.feature_names) <= set(panel.columns) else None,
+            "as_of": as_of,
+            "generated_at": record["generated_at"],
+        }
+    )
     return record
+
+
+def _build_analytics(
+    panel, macro_df, model, latest_X, features, components, as_of, previous, current, documents
+):
+    """Everything that makes the call interpretable rather than oracular.
+
+    Each block is independently guarded: one analytic failing must not cost the
+    run its prediction, so a failure records its reason and the rest proceed.
+    """
+    payload = {}
+
+    def attempt(name, function):
+        try:
+            payload[name] = function()
+        except Exception as exc:
+            LOG.warning("Analytic %r failed: %s", name, exc)
+            payload[name] = {"error": str(exc)}
+
+    attempt("delta", lambda: analytics.compute_delta(current, previous))
+    attempt("price_series", lambda: _compact_price_series(panel))
+    attempt("analogues", lambda: analytics.find_analogues(panel, horizon=HORIZON))
+    attempt("regime", lambda: analytics.label_regimes(panel, horizon=HORIZON))
+    attempt("divergence", lambda: analytics.sentiment_divergence(panel))
+    attempt("surprise", lambda: analytics.surprise_index(macro_df, list(MACRO_SERIES)))
+    attempt(
+        "events",
+        lambda: events.forward_window_events(as_of, sessions=HORIZON, session_index=panel.index),
+    )
+    attempt("calendar", events.calendar_health)
+    attempt("disagreement", lambda: _disagreement(components))
+    attempt(
+        "flip_points",
+        lambda: analytics.find_flip_points(
+            predict_proba=lambda frame: model.predict_proba(frame)[-1],
+            base_row=latest_X,
+            features=[item["feature"] for item in features[:5]],
+            history=panel,
+            classify=lambda p: classify_probability(p, model.up_threshold, model.down_threshold),
+        ),
+    )
+
+    themes = {}
+
+    def build_themes():
+        nonlocal themes
+        themes = narratives.extract_themes(documents)
+        return themes
+
+    attempt("themes", build_themes)
+    attempt(
+        "theme_shift",
+        lambda: narratives.theme_shift(
+            themes.get("themes"),
+            ((previous or {}).get("analytics", {}).get("themes") or {}).get("themes"),
+        ),
+    )
+    return payload
+
+
+def _compact_price_series(panel, sessions=180):
+    """Recent closes for the dashboard chart, persisted so a restart still has
+    something to draw before the next scheduled run."""
+    if PRICE_COL not in panel.columns:
+        return []
+    tail = panel[PRICE_COL].astype(float).dropna().iloc[-sessions:]
+    return [
+        {"date": _index_label(label), "close": round(float(value), 2)}
+        for label, value in tail.items()
+    ]
+
+
+def _disagreement(components):
+    """How far apart the two models are on the live row."""
+    lstm = components.get("lstm")
+    if lstm is None:
+        return {
+            "available": False,
+            "note": "LSTM did not train for this run; no second opinion to compare.",
+        }
+
+    xgb_probability = float(components["xgboost"][-1])
+    lstm_probability = float(lstm[-1])
+    spread = abs(xgb_probability - lstm_probability)
+    if spread < 0.05:
+        note = "The tree model and the sequence model agree closely."
+    elif spread < 0.15:
+        note = "Mild disagreement between the two models."
+    else:
+        note = (
+            "The two models disagree materially - the blended confidence is "
+            "hiding a genuine split, so treat this call as low conviction."
+        )
+
+    return {
+        "available": True,
+        "xgboost": xgb_probability,
+        "lstm": lstm_probability,
+        "spread": spread,
+        "note": note,
+    }
+
+
+def _raise_alerts(record, previous):
+    """Record a signal change, and push it onward if a webhook is configured."""
+    if not previous:
+        return
+    if record["prediction"] == previous.get("prediction"):
+        return
+
+    message = (
+        f"Signal changed {previous.get('prediction')} to {record['prediction']} "
+        f"({record['confidence'] * 100:.1f}% confidence, as of {record['as_of_date']})."
+    )
+    try:
+        save_alert(
+            kind="signal_change",
+            message=message,
+            from_signal=previous.get("prediction"),
+            to_signal=record["prediction"],
+            as_of_date=record["as_of_date"],
+        )
+        LOG.info("ALERT: %s", message)
+    except Exception:
+        LOG.exception("Could not store the signal-change alert")
+
+    webhook = os.environ.get("ALERT_WEBHOOK_URL")
+    if not webhook:
+        return
+    try:
+        import urllib.request
+
+        request = urllib.request.Request(
+            webhook,
+            data=json.dumps(
+                {
+                    "text": message,
+                    "signal": record["prediction"],
+                    "previous_signal": previous.get("prediction"),
+                    "confidence": record["confidence"],
+                    "as_of": record["as_of_date"],
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(request, timeout=10).close()
+        LOG.info("Alert delivered to the configured webhook")
+    except Exception as exc:
+        LOG.warning("Alert webhook failed (%s); the alert is still stored", exc)
 
 
 def scheduled_job():
@@ -1282,7 +1700,10 @@ def scheduled_job():
 def add_cors_headers(response):
     # The dashboard is a static site on a different origin.
     response.headers.setdefault("Access-Control-Allow-Origin", os.environ.get("CORS_ORIGIN", "*"))
-    response.headers.setdefault("Access-Control-Allow-Methods", "GET, OPTIONS")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    # /api/whatif and /api/ask post JSON, which makes the browser preflight.
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type")
+    response.headers.setdefault("Access-Control-Max-Age", "600")
     return response
 
 
@@ -1291,22 +1712,202 @@ def health_check():
     return jsonify({"status": "healthy", "message": "Market Engine is running."})
 
 
+def _pending(what="prediction"):
+    return (
+        jsonify(
+            {
+                "status": "pending",
+                "message": f"No {what} is available yet. The pipeline runs on "
+                "startup and then on its refresh interval.",
+            }
+        ),
+        503,
+    )
+
+
 @app.route("/api/latest")
 def latest_prediction():
-    """Most recent persisted run: signal, confidence, attribution, backtest."""
+    """Most recent persisted run: signal, confidence, attribution, analytics."""
     record = load_latest_prediction()
     if record is None:
-        return (
-            jsonify(
-                {
-                    "status": "pending",
-                    "message": "No prediction has been generated yet. The pipeline "
-                    "runs on startup and then on its refresh interval.",
-                }
-            ),
-            503,
-        )
+        return _pending()
     return jsonify(record)
+
+
+@app.route("/api/history")
+def prediction_history():
+    """Past runs, oldest first, with their resolved outcomes where known."""
+    limit = min(max(request.args.get("limit", default=100, type=int), 1), 500)
+    resolved_only = request.args.get("resolved", "").lower() in {"1", "true", "yes"}
+    history = load_prediction_history(limit=limit, resolved_only=resolved_only)
+    return jsonify(
+        {
+            "count": len(history),
+            "predictions": [
+                {
+                    "as_of_date": run["as_of_date"],
+                    "generated_at": run["generated_at"],
+                    "prediction": run["prediction"],
+                    "probability": run["probability"],
+                    "confidence": run["confidence"],
+                    "outcome": run.get("outcome"),
+                }
+                for run in history
+            ],
+        }
+    )
+
+
+@app.route("/api/scorecard")
+def scorecard():
+    """The realised record: hit rate, empirical calibration, event conditioning.
+
+    Computed per request rather than cached, so it reflects every outcome
+    resolved since the last pipeline run.
+    """
+    history = load_prediction_history(limit=500)
+    resolved = [
+        {
+            "as_of_date": run["as_of_date"],
+            "prediction": run["prediction"],
+            "confidence": run["confidence"],
+            "correct": (run.get("outcome") or {}).get("correct"),
+            "realized_return": (run.get("outcome") or {}).get("realized_return"),
+            "actual_direction": (run.get("outcome") or {}).get("actual_direction"),
+        }
+        for run in history
+    ]
+
+    payload = analytics.build_scorecard(resolved)
+    try:
+        payload["by_event"] = events.conditional_accuracy(resolved, sessions=HORIZON)
+    except Exception as exc:
+        LOG.warning("Event conditioning failed: %s", exc)
+        payload["by_event"] = None
+    payload["n_runs_total"] = len(history)
+    payload["n_unresolved"] = sum(1 for row in resolved if row["correct"] is None)
+    return jsonify(payload)
+
+
+@app.route("/api/series")
+def price_series():
+    """Recent closes for the price chart, from the latest persisted run."""
+    record = load_latest_prediction()
+    series = (record or {}).get("analytics", {}).get("price_series")
+    if not series:
+        return _pending("price series")
+    return jsonify({"as_of": record["as_of_date"], "points": series})
+
+
+@app.route("/api/alerts")
+def alerts():
+    """Signal changes, newest first."""
+    limit = min(max(request.args.get("limit", default=25, type=int), 1), 100)
+    return jsonify({"alerts": load_alerts(limit=limit)})
+
+
+@app.route("/api/whatif", methods=["POST", "OPTIONS"])
+def what_if():
+    """Re-score the live row with features overridden.
+
+    Body: ``{"overrides": {"<feature>": <number>, ...}}``. Answers the question
+    the dashboard is really for - what would have to change for this call to be
+    different - without the caller needing the model.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    model = _LIVE.get("model")
+    base_row = _LIVE.get("row")
+    if model is None or base_row is None:
+        return _pending("trained model")
+
+    body = request.get_json(silent=True) or {}
+    overrides = body.get("overrides")
+    if not isinstance(overrides, dict):
+        return jsonify({"error": "expected an object under 'overrides'"}), 400
+    if len(overrides) > 40:
+        return jsonify({"error": "too many overrides (max 40)"}), 400
+
+    try:
+        result = analytics.counterfactual(
+            predict_proba=lambda frame: model.predict_proba(frame)[-1],
+            base_row=base_row,
+            overrides=overrides,
+            classify=lambda p: classify_probability(p, model.up_threshold, model.down_threshold),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        LOG.exception("Counterfactual scoring failed")
+        return jsonify({"error": "counterfactual scoring failed"}), 500
+
+    result["as_of"] = _LIVE.get("as_of")
+    if result["rejected"]:
+        result["note"] = (
+            "Ignored unknown or non-numeric features: " + ", ".join(result["rejected"])
+        )
+    return jsonify(result)
+
+
+@app.route("/api/features")
+def live_features():
+    """The live row's feature values and historical ranges.
+
+    The what-if sliders need sensible bounds; inventing them client-side would
+    produce values the model has never seen.
+    """
+    base_row = _LIVE.get("row")
+    history = _LIVE.get("history")
+    if base_row is None or base_row.empty:
+        return _pending("feature row")
+
+    record = load_latest_prediction() or {}
+    wanted = [item["feature"] for item in (record.get("top_features") or [])[:12]]
+    wanted = [name for name in wanted if name in base_row.columns] or list(base_row.columns[:12])
+
+    payload = []
+    for name in wanted:
+        current = float(base_row.iloc[0][name])
+        entry = {"feature": name, "current": current}
+        if history is not None and name in history.columns:
+            series = history[name].astype(float)
+            entry.update(
+                {
+                    "min": float(series.min()),
+                    "max": float(series.max()),
+                    "mean": float(series.mean()),
+                    "std": float(series.std(ddof=0)),
+                    "percentile": float((series <= current).mean()),
+                }
+            )
+        payload.append(entry)
+
+    return jsonify({"as_of": _LIVE.get("as_of"), "features": payload})
+
+
+@app.route("/api/ask", methods=["POST", "OPTIONS"])
+def ask():
+    """Answer a question about past runs, grounded only in the stored record."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    body = request.get_json(silent=True) or {}
+    question = (body.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "expected a 'question' string"}), 400
+    if len(question) > 500:
+        return jsonify({"error": "question too long (max 500 characters)"}), 400
+
+    history = load_prediction_history(limit=200)
+    if not history:
+        return _pending("run history")
+
+    try:
+        return jsonify(narratives.answer_question(question, history))
+    except Exception:
+        LOG.exception("Question answering failed")
+        return jsonify({"error": "question answering failed"}), 500
 
 
 # ==========================================
