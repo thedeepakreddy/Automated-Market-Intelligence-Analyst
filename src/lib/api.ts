@@ -7,7 +7,24 @@
  * instead of "failed".
  */
 
-const BASE = (import.meta.env.VITE_API_URL ?? 'http://localhost:5000').replace(/\/$/, '');
+/**
+ * Resolve the configured API origin defensively.
+ *
+ * Vite bakes VITE_API_URL in at *build* time. Left unset in production it
+ * falls back to localhost, which in every visitor's own browser means "their
+ * machine" - guaranteed ERR_CONNECTION_REFUSED, on every load, with nothing
+ * to see server-side. A platform's service-discovery env var (Render's
+ * `fromService`, for one) can also hand back a bare host with no scheme,
+ * which would otherwise silently become a same-origin relative path instead
+ * of failing loudly - so a missing scheme is added rather than assumed away.
+ */
+function resolveApiBase(): string {
+  const raw = (import.meta.env.VITE_API_URL ?? 'http://localhost:5000').trim();
+  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  return withScheme.replace(/\/$/, '');
+}
+
+const BASE = resolveApiBase();
 
 export type Signal = 'UP' | 'DOWN' | 'UNCERTAIN';
 

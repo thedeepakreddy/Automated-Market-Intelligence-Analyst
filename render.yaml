@@ -17,4 +17,15 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.11.0
+      - key: VITE_API_URL
+        # Vite bakes this in at BUILD time, not runtime - unset, the app falls
+        # back to http://localhost:5000, which in a visitor's own browser means
+        # "their machine", not this backend. Always fails with
+        # ERR_CONNECTION_REFUSED, on every browser, every time - not a bug you
+        # can see server-side. fromService pulls the live URL Render assigned
+        # the API service, so this can't drift out of sync with a manual value.
+        fromService:
+          name: market-intelligence-api
+          type: web
+          property: host
 
